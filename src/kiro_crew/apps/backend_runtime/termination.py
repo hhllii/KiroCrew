@@ -20,6 +20,7 @@ from kiro_crew.apps.backend_runtime.pidfile import (
     _forget_app_pid,
     _forget_app_pid_if,
     _proc_start_time,
+    _restore_app_pid,
 )
 from kiro_crew.apps.backend_runtime.ports import _allocated_ports
 from kiro_crew.apps.backend_runtime.probe import _health_probe
@@ -311,6 +312,16 @@ def stop_app_backend(
     path the port is probed, and one that still answers reports failure with
     tracking restored instead, so the caller can retry. Only a caller enforcing a
     withdrawn trust ceiling needs that, and it pays for the probe.
+
+    This stop is purely best-effort about the recovery row: a tracked stop forgets
+    it (restoring on refusal for a retry), an untracked stop keeps it so a later
+    start can re-adopt the survivor. An ORDINARY stop (no ``_retry_if_serving``)
+    that pops a tracked root but tolerates a surviving descendant also puts the row
+    back: the row is the only handle a later re-enable has to re-attribute that
+    survivor, and it is only legitimately invalidated by a successful uninstall (its
+    confirmed commit-boundary delete) or a successful update restart. It never
+    deletes an UNINSTALL's row -- the uninstall handler does that itself, at its
+    commit boundary -- so this path never needs to raise.
     """
     # Teardown participates in the health serialization, so the pop cannot land in the
     # middle of a reconcile. Without this, a watcher that had already passed its identity
@@ -330,10 +341,37 @@ def stop_app_backend(
             _restart_attempts.pop(app_name, None)
         # Keep cleanup inside the lifecycle transition's serialization. A later explicit
         # start cannot record its successor between the pop and this identity check.
-        if ap is not None and ap.proc is not None:
-            _forget_app_pid_if(app_name, ap.pid, ap.pid_start_time)
-        else:
-            _forget_app_pid(app_name)
+        # The removed row is kept because this stop can still REFUSE below, and each
+        # refusal restores tracking for a retry; an adopted backend's provenance is read
+        # from that row, so a retry without it cannot attribute the listener it is
+        # trying to stop and refuses forever.
+        #
+        # Only a tracked stop forgets the row. An untracked stop (``ap is None`` — this
+        # process never tracked the backend) leaves the recovery record intact: a later
+        # start attributes an adopted survivor against it, and discarding it here would
+        # strand that backend, unadoptable, because nothing this stop knew of it.
+        #
+        # This stop never deletes the UNINSTALL's provenance row: the uninstall handler
+        # does that itself, as a CONFIRMED preflight before the non-idempotent
+        # onUninstall, so a failed delete aborts the whole uninstall rather than being
+        # swallowed here (where onUninstall has already run and an abort would strand a
+        # half-removed app). So this path stays purely best-effort and never raises.
+        forgotten_row: dict[str, Any] | None = None
+        if ap is not None:
+            if ap.proc is not None:
+                forgotten_row = _forget_app_pid_if(app_name, ap.pid, ap.pid_start_time)
+            else:
+                forgotten_row = _forget_app_pid(app_name)
+
+    def _restore_for_retry() -> None:
+        """Undo exactly what the transition above removed, so a retry can proceed."""
+        if forgotten_row is not None:
+            _restore_app_pid(app_name, forgotten_row)
+        with _lock:
+            if ap is not None:
+                _processes.setdefault(app_name, ap)
+                if ap.port:
+                    _allocated_ports.setdefault(app_name, ap.port)
 
     if not ap:
         return False
@@ -419,11 +457,25 @@ def stop_app_backend(
                     app_name,
                     exc,
                 )
-            with _lock:
-                _processes.setdefault(app_name, ap)
-                if ap.port:
-                    _allocated_ports.setdefault(app_name, ap.port)
+            _restore_for_retry()
             return False
+        elif _retry_if_serving is None and forgotten_row is not None:
+            # ORDINARY stop (no withdrawn ceiling) of a tracked root: this is a
+            # rollback-capable stop -- a disable, or the stop half of an update that
+            # may fail and roll back -- not an uninstall. A descendant can outlive the
+            # root we signalled (the group-signal/single-wait gap documented above),
+            # and such a survivor is TOLERATED here. The in-memory tracking stays
+            # popped (the process we spawned is gone), but the pidfile RECOVERY ROW is
+            # put back: it is the only handle a later re-enable has to re-attribute a
+            # surviving listener, and without it that listener is permanently
+            # unattributable (adoption fails closed with no row, with no reaper row to
+            # name the orphan). A row left behind for a backend that genuinely stopped
+            # is harmless -- the stale reaper drops it, and a fresh start's own record
+            # wins via setdefault. The row is only legitimately invalidated by a
+            # successful uninstall (its confirmed commit-boundary delete) or a
+            # successful update restart -- never by a stop that may have left a
+            # listener running.
+            _restore_app_pid(app_name, forgotten_row)
     elif ap.proc is not None:
         # The tracked ROOT has already exited, but the record is only now being
         # dropped -- a launcher that died after startup while the server it forked
@@ -467,10 +519,7 @@ def stop_app_backend(
                         app_name,
                         exc,
                     )
-                with _lock:
-                    _processes.setdefault(app_name, ap)
-                    if ap.port:
-                        _allocated_ports.setdefault(app_name, ap.port)
+                _restore_for_retry()
                 return False
             if gone is False:
                 logger.warning(
@@ -480,6 +529,14 @@ def stop_app_backend(
                     app_name,
                     ap.proc.pid,
                 )
+                # Reached only when refuse is False, i.e. an ORDINARY stop
+                # (_retry_if_serving is None) tolerating a surviving descendant. As on
+                # the live-root tolerate path, keep the pidfile RECOVERY ROW: it is the
+                # only handle a later re-enable has to re-attribute this survivor, and
+                # a stale row for a truly-stopped backend is reaped harmlessly. Only a
+                # successful uninstall/update may invalidate it.
+                if _retry_if_serving is None and forgotten_row is not None:
+                    _restore_app_pid(app_name, forgotten_row)
     elif not ap.proc and ap.port:
         # Adopted process (proc=None) — kill only PIDs we recorded at adoption
         if not ap.adopted_pids:
@@ -499,10 +556,7 @@ def stop_app_backend(
             except Exception as exc:
                 logger.debug("SEL audit failed for rejected_no_pids %s: %s", app_name, exc)
             # Restore tracking so a retry is possible after re-adoption
-            with _lock:
-                _processes.setdefault(app_name, ap)
-                if ap.port:
-                    _allocated_ports.setdefault(app_name, ap.port)
+            _restore_for_retry()
             return False
         try:
             # PID-reuse guard: signal a recorded PID only when its live
@@ -618,10 +672,7 @@ def stop_app_backend(
                 exc,
             )
             # Restore tracking so a retry is possible
-            with _lock:
-                _processes.setdefault(app_name, ap)
-                if ap.port:
-                    _allocated_ports.setdefault(app_name, ap.port)
+            _restore_for_retry()
             return False
         if _retry_if_serving is not None and _health_probe(ap.port, _retry_if_serving).healthy:
             # AMBIGUOUS observation, resolved by the caller who cares.
@@ -659,10 +710,7 @@ def stop_app_backend(
                     app_name,
                     exc,
                 )
-            with _lock:
-                _processes.setdefault(app_name, ap)
-                if ap.port:
-                    _allocated_ports.setdefault(app_name, ap.port)
+            _restore_for_retry()
             return False
 
     if ap.proc:
