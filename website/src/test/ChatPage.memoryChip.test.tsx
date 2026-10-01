@@ -145,6 +145,29 @@ describe('memory chip above the composer', () => {
     await waitFor(() => expect(screen.getByTestId('action-error')).toHaveTextContent('save failed'))
   })
 
+  it('keeps the unsent draft when switching memory mode, both directions', async () => {
+    createChatSlot
+      .mockResolvedValueOnce({ key: 'slot-b', messages: 0, running: false, memory_mode: 'incognito' })
+      .mockResolvedValueOnce({ key: 'slot-c', messages: 0, running: false, memory_mode: 'persistent' })
+    const store = await renderWith({ messages: [] })
+    const composer = () => screen.getAllByRole('textbox').at(-1)! as HTMLTextAreaElement
+
+    fireEvent.change(composer(), { target: { value: 'half-written prompt' } })
+    expect(composer().value).toBe('half-written prompt')
+
+    fireEvent.click(screen.getByText('Choose memory mode').closest('button')!)
+    fireEvent.click(screen.getByText('Incognito').closest('button')!)
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('slot-b'))
+    await waitFor(() => expect(deleteChatSlot).toHaveBeenCalledWith('slot-a'))
+    await waitFor(() => expect(composer().value).toBe('half-written prompt'))
+
+    // And back: the "switch to persistent" chip recreates the slot again.
+    fireEvent.change(composer(), { target: { value: 'half-written prompt, more' } })
+    fireEvent.click(screen.getByTestId('memory-mode-chip'))
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('slot-c'))
+    await waitFor(() => expect(composer().value).toBe('half-written prompt, more'))
+  })
+
   it('is absent once the session has messages', async () => {
     await renderWith({ messages: [{ role: 'user', content: 'hello' }, { role: 'assistant', content: 'hi' }] })
     expect(screen.queryByTestId('composer-memory-chip')).toBeNull()
