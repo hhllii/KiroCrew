@@ -1629,6 +1629,33 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
             {"error": f"only failed agents can be retried (outcome={old.outcome})"},
             status=409,
         )
+    # Claimed before the first await, on the manager that also guards the
+    # continuation side: two retries arriving together (two tabs, a double
+    # click) and a retry racing a spawn_continue cannot both start work.
+    successor = state.subagents.claim_retry(old)
+    if isinstance(successor, str) and successor:
+        return web.json_response(
+            {
+                "error": (
+                    f"run {agent_id} was already picked up by run {successor}; "
+                    "retrying it would run its task a second time"
+                ),
+                "code": "retry_superseded",
+                "superseded_by": successor,
+            },
+            status=409,
+        )
+    try:
+        return await _retry_failed_run(state, agent_id, old)
+    finally:
+        # A start that never landed leaves the run retryable; a landed one was
+        # already settled with its id, which this call leaves alone.
+        state.subagents.settle_retry(old, None)
+
+
+async def _retry_failed_run(state: "DashboardState", agent_id: str, old: Any) -> web.Response:
+    """Start the replacement run for a failed *old*; the checks are the caller's."""
+    assert state.subagents is not None
     execution = old.execution_context
     if execution is None:
         from kiro_crew.subagent_persistence import read_run_execution
@@ -1699,6 +1726,8 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         )
     if info.done and info.error:
         return web.json_response({"error": info.error}, status=400)
+    state.subagents.settle_retry(old, info.id)
+    logger.info("Subagent %s retried as %s (POST /api/spawn/{id}/retry)", agent_id, info.id)
     return web.json_response({"id": info.id, "retried_from": agent_id, "status": "spawned"})
 
 

@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.subagent_manager.continuation import ContinuationCoordinator
 from kiro_crew.subagent_persistence import create_agent_folder, write_run_agent
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
@@ -3677,3 +3678,93 @@ class TestSharedBindIdentityLabel:
         info, live, _ = await self._bound(ACP_BACKEND_KIRO)
         assert info._session_provider == PROVIDER_LABEL_DEFAULT
         assert live and live[0].get("provider") == PROVIDER_LABEL_DEFAULT
+
+
+class TestSuccessorClaim:
+    """A failed run has one successor: a dashboard retry or a continuation."""
+
+    @staticmethod
+    def _failed(manager: SubagentManager, run_id: str = "fail1234") -> SubagentInfo:
+        failed = SubagentInfo(id=run_id, task="t", done=True, error="turn_limit:100")
+        manager._agents[run_id] = failed
+        return failed
+
+    def test_first_retry_is_granted_and_a_second_is_refused(self) -> None:
+        manager = _manager()
+        failed = self._failed(manager)
+        assert manager.claim_retry(failed) == ""
+        assert manager.claim_retry(failed) != ""
+        manager.settle_retry(failed, "retry5678")
+        assert manager.claim_retry(failed) == "retry5678"
+
+    def test_released_claim_is_retryable(self) -> None:
+        manager = _manager()
+        failed = self._failed(manager)
+        assert manager.claim_retry(failed) == ""
+        manager.settle_retry(failed, None)
+        assert manager.claim_retry(failed) == ""
+
+    def test_queued_continuation_takes_the_claim(self) -> None:
+        manager = _manager()
+        failed = self._failed(manager)
+        manager._queue.append(
+            {"_preassigned_id": "cont0001", "conversation_key": "subagent:fail1234"}
+        )
+        assert manager.claim_retry(failed) == "cont0001"
+
+    def test_finished_continuation_takes_the_claim(self) -> None:
+        manager = _manager()
+        failed = self._failed(manager)
+        manager._agents["cont0001"] = SubagentInfo(
+            id="cont0001", task="t", done=True, conversation_key="subagent:fail1234"
+        )
+        assert manager.claim_retry(failed) == "cont0001"
+
+    def test_continuation_of_a_retried_run_is_refused(self) -> None:
+        manager = _manager()
+        failed = self._failed(manager)
+        assert manager.claim_retry(failed) == ""
+        manager.settle_retry(failed, "retry5678")
+        with patch("kiro_crew.subagent.sel"), patch.object(manager, "spawn") as spawn:
+            info = manager.continue_conversation("fail1234", "more work")
+        assert info is not None and info.done
+        assert info.error.startswith("conversation_busy")
+        assert "retry5678" in info.error
+        spawn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_is_refused_while_a_continuation_start_is_in_flight(self) -> None:
+        """The continuation claims before its first await, so a retry landing
+        while its durable accept is still pending sees the claim."""
+        manager = _manager()
+        failed = self._failed(manager)
+        gate = asyncio.Event()
+        seen: list[str] = []
+
+        async def slow_continue(*_a, **_k):
+            seen.append(manager.claim_retry(failed))
+            await gate.wait()
+            return SubagentInfo(id="cont0001", task="t")
+
+        with patch.object(
+            ContinuationCoordinator, "continue_conversation_async_impl", new=slow_continue
+        ):
+            task = asyncio.ensure_future(manager.continue_conversation_async("fail1234", "x"))
+            await asyncio.sleep(0)
+            assert manager.claim_retry(failed) != ""
+            gate.set()
+            await task
+        assert seen and seen[0] != ""
+        assert manager.claim_retry(failed) == "cont0001"
+
+    @pytest.mark.asyncio
+    async def test_failed_continuation_releases_its_claim(self) -> None:
+        manager = _manager()
+        failed = self._failed(manager)
+
+        async def refused(*_a, **_k):
+            return SubagentInfo(id="x", task="t", done=True, error="conversation_gone: no")
+
+        with patch.object(ContinuationCoordinator, "continue_conversation_async_impl", new=refused):
+            await manager.continue_conversation_async("fail1234", "x")
+        assert manager.claim_retry(failed) == ""

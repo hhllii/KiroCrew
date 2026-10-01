@@ -1079,6 +1079,8 @@ class _RunCreditAccounting:
 
 
 _TURN_LIMIT = DEFAULT_SUBAGENT_MAX_TURNS
+# Successor-claim marker while a retry or continuation start is in flight.
+SUCCESSOR_PENDING = "(starting)"
 _REAPER_INTERVAL = 60  # seconds between reaper sweeps
 # Idle TTL for continuable conversations (keep=True): a conversation with no
 # run for this long has its session files + map entry deleted by the reaper.
@@ -2418,6 +2420,13 @@ class SubagentInfo:
     # finds the persisted sid and arms session/load. Empty ⇒ the default
     # ``subagent:{id}``.
     conversation_key: str = ""
+    # Successor claims, owned by ``SubagentManager.claim_retry`` and the
+    # continuation entries: the id of the run a dashboard retry or a
+    # ``spawn_continue`` started from this one, or ``SUCCESSOR_PENDING`` while
+    # that start is in flight. A failed card stays failed for history, so these
+    # are what stop a retry from running its task beside another successor.
+    _retried_as: str = ""
+    _continued_as: str = ""
     # Optional subprocess cwd override. When set, the subagent kiro-cli/claude-code
     # process launches here instead of the default ``subagent_<id>`` sandbox, so
     # cwd-relative resource globs (``.kiro/steering/**/*.md``, ``AGENTS.md``,
@@ -5131,6 +5140,72 @@ class SubagentManager:
         live session (no conversation of its own; the parent is the lever)."""
         return self._continuation.native_child_resume_refusal(conversation_id)
 
+    def claim_retry(self, failed: SubagentInfo) -> str:
+        """Claim the right to retry *failed*; ``""`` when granted, else the owner.
+
+        A failed run has at most one successor. It is taken when a retry or a
+        ``spawn_continue`` of this run already claimed it, or when a run holds
+        its conversation ``subagent:<id>`` -- queued, live or finished. A grant
+        marks the claim ``SUCCESSOR_PENDING`` with no await in between, so a
+        concurrent retry or continuation sees it; :meth:`settle_retry` records
+        the outcome.
+        """
+        for owner in (failed._retried_as, failed._continued_as):
+            if owner:
+                return owner
+        conv_key = f"subagent:{failed.id}"
+        busy = self._conversation_busy(conv_key)
+        if busy is not None and busy.id != failed.id:
+            return busy.id
+        for info in self._agents.values():
+            if info.id != failed.id and info.conversation_key == conv_key:
+                return info.id
+        failed._retried_as = SUCCESSOR_PENDING
+        return ""
+
+    def settle_retry(self, failed: SubagentInfo, successor_id: str | None) -> None:
+        """Record the run a granted retry started, or release a claim that did not
+        land (``successor_id`` None). A claim already settled is left alone."""
+        if failed._retried_as == SUCCESSOR_PENDING:
+            failed._retried_as = successor_id or ""
+
+    def _claim_continuation(
+        self, conv_id: str, task: str, parent_session_key: str, stage_boundary_owner: str
+    ) -> tuple[SubagentInfo | None, SubagentInfo | None]:
+        """``(original, refusal)`` for a continuation of *conv_id*.
+
+        A refusal when a retry already claimed the run: its task runs as that
+        retry now. Otherwise the continuation claims the run before any await,
+        so a retry arriving while this start is in flight is refused.
+        """
+        original = self._agents.get(conv_id)
+        if original is None:
+            return None, None
+        if original._retried_as:
+            refusal = SubagentInfo(
+                id=self._mint_agent_id(),
+                task=_redact(task),
+                done=True,
+                parent_session_key=parent_session_key,
+                _stage_boundary_owner=stage_boundary_owner,
+                error=(
+                    f"conversation_busy: run {conv_id} was retried as run "
+                    f"{original._retried_as}, which owns its task now; continue "
+                    "that run's conversation instead"
+                ),
+            )
+            return original, refusal
+        if not original._continued_as:
+            original._continued_as = SUCCESSOR_PENDING
+        return original, None
+
+    @staticmethod
+    def _settle_continuation(original: SubagentInfo | None, result: SubagentInfo | None) -> None:
+        if original is None or original._continued_as != SUCCESSOR_PENDING:
+            return
+        landed = result is not None and not (result.done and result.error)
+        original._continued_as = result.id if landed and result is not None else ""
+
     def continue_conversation(
         self,
         conv_id: str,
@@ -5145,19 +5220,29 @@ class SubagentManager:
         _crew_log_asked: "tuple[str, int] | None" = None,
         _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
-        return self._continuation.continue_conversation_impl(
-            conv_id,
-            task,
-            parent_session_key,
-            agent,
-            model,
-            max_turns,
-            cwd,
-            _preassigned_id,
-            _memory_mode=_memory_mode,
-            _crew_log_asked=_crew_log_asked,
-            _stage_boundary_owner=_stage_boundary_owner,
+        original, refusal = self._claim_continuation(
+            conv_id, task, parent_session_key, _stage_boundary_owner
         )
+        if refusal is not None:
+            return refusal
+        result: SubagentInfo | None = None
+        try:
+            result = self._continuation.continue_conversation_impl(
+                conv_id,
+                task,
+                parent_session_key,
+                agent,
+                model,
+                max_turns,
+                cwd,
+                _preassigned_id,
+                _memory_mode=_memory_mode,
+                _crew_log_asked=_crew_log_asked,
+                _stage_boundary_owner=_stage_boundary_owner,
+            )
+            return result
+        finally:
+            self._settle_continuation(original, result)
 
     async def continue_conversation_async(
         self,
@@ -5173,19 +5258,29 @@ class SubagentManager:
         _crew_log_asked: "tuple[str, int] | None" = None,
         _stage_boundary_owner: str = "",
     ) -> SubagentInfo | None:
-        return await self._continuation.continue_conversation_async_impl(
-            conv_id,
-            task,
-            parent_session_key,
-            agent,
-            model,
-            max_turns,
-            cwd,
-            _preassigned_id,
-            _memory_mode,
-            _crew_log_asked,
-            _stage_boundary_owner,
+        original, refusal = self._claim_continuation(
+            conv_id, task, parent_session_key, _stage_boundary_owner
         )
+        if refusal is not None:
+            return refusal
+        result: SubagentInfo | None = None
+        try:
+            result = await self._continuation.continue_conversation_async_impl(
+                conv_id,
+                task,
+                parent_session_key,
+                agent,
+                model,
+                max_turns,
+                cwd,
+                _preassigned_id,
+                _memory_mode,
+                _crew_log_asked,
+                _stage_boundary_owner,
+            )
+            return result
+        finally:
+            self._settle_continuation(original, result)
 
     def _continue_prelude(
         self,
