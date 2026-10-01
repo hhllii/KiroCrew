@@ -12,6 +12,7 @@ import { act, screen, fireEvent } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import { safeSetItem } from '../utils/safeStorage'
 import { setDesktopUpdateAvailable } from '../store/dashboardSlice'
+import { MAC_FULLSCREEN_TOP_RESERVE_PX } from '../lib/electron'
 
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
@@ -160,11 +161,18 @@ describe('App shell — macOS fullscreen class', () => {
     expect(root).toBeTruthy()
     expect(root.classList.contains('mac-fullscreen')).toBe(false)
 
+    // The frame around local and remote panes clears the fullscreen menu-bar
+    // strip only while fullscreen, so the header's crew switcher stays clickable.
+    const frame = screen.getByTestId('app-frame')
+    expect(frame.style.paddingTop).toBe('')
+
     act(() => fsCallback?.(true))
     expect(root.classList.contains('mac-fullscreen')).toBe(true)
+    expect(frame.style.paddingTop).toBe(`${MAC_FULLSCREEN_TOP_RESERVE_PX}px`)
 
     act(() => fsCallback?.(false))
     expect(root.classList.contains('mac-fullscreen')).toBe(false)
+    expect(frame.style.paddingTop).toBe('')
     delete (window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean) => void) => () => void } }).electronAPI
   })
 })

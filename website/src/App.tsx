@@ -90,7 +90,7 @@ const MOBILE_NAV_INSET = 8
 const mobileNavTravel = () =>
   MOBILE_NAV_WIDTH + MOBILE_NAV_INSET + 3 + safeAreaLeft()
 import { usePersistedBool } from './hooks/usePersistedBool'
-import { isMacElectron, isWinElectron, isLinuxFramelessElectron } from './lib/electron'
+import { isMacElectron, isWinElectron, isLinuxFramelessElectron, MAC_FULLSCREEN_TOP_RESERVE_PX } from './lib/electron'
 import { DndContext, closestCenter, DragOverlay, type DragStartEvent, type DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
@@ -3994,7 +3994,9 @@ export default function App() {
        which hides the bottom row (the chat composer) on phones.
        w-full, not w-screen: 100vw resolves independently of layout, so it can
        disagree with the `(max-width: 767px)` query this shell branches on. */
-    <div className="h-screen supports-[height:100dvh]:h-dvh w-full flex flex-col overflow-hidden bg-bg">
+    <div className="h-screen supports-[height:100dvh]:h-dvh w-full flex flex-col overflow-hidden bg-bg"
+      data-testid="app-frame"
+      style={macFullscreen ? { paddingTop: MAC_FULLSCREEN_TOP_RESERVE_PX } : undefined}>
       {/* Embedded remote panes receive their switcher model from the parent via
           this bridge (option B) — no-op in the top-level dashboard. */}
       <EmbeddedHostBridge />
