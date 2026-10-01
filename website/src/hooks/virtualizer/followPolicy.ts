@@ -62,6 +62,9 @@ type SetWindowRange = (next: WindowRange | ((prev: WindowRange) => WindowRange))
 export interface FollowState {
   stickRef: Ref<boolean>
   lastWriteTopRef: Ref<number>
+  /** Target of the last programmatic write, whatever its accounting. Only
+   *  writeScrollTop sets it, so the follow handler never re-baselines it. */
+  lastProgrammaticTopRef: Ref<number>
   lastWriteClientHRef: Ref<number>
   smoothPinActiveRef: Ref<boolean>
   prevSmoothTopRef: Ref<number>
@@ -127,6 +130,7 @@ export function useFollowState(followOutput: boolean): FollowState {
   // hardware events and by the smooth-pin grab interrupts, never by scroll
   // events themselves.
   const lastHardInputAtRef = useRef<number>(Number.NEGATIVE_INFINITY)
+  const lastProgrammaticTopRef = useRef<number>(-1)
   // UPWARD-only sibling of lastHardInputAtRef: stamped when the input's own
   // direction was up (wheel up / upward key / upward touch drag), or when a
   // smooth-glide grab moved scrollTop backward (confirmed upward by motion).
@@ -233,6 +237,7 @@ export function useFollowState(followOutput: boolean): FollowState {
       if (typeof el.scrollTo === 'function') el.scrollTo({ top, behavior })
       else el.scrollTop = top
       lastWriteTopRef.current = accounting === 'pin' ? top : -1
+      lastProgrammaticTopRef.current = top
       lastWriteClientHRef.current = accounting === 'pin' ? el.clientHeight : -1
       // The direction reference must move WITH our own writes, synchronously.
       // A programmatic scroll's event lands asynchronously (and a fake scroller
@@ -304,6 +309,7 @@ export function useFollowState(followOutput: boolean): FollowState {
   return {
     stickRef,
     lastWriteTopRef,
+    lastProgrammaticTopRef,
     lastWriteClientHRef,
     smoothPinActiveRef,
     prevSmoothTopRef,
