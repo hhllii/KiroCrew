@@ -55,6 +55,7 @@ from kiro_crew import (
     acp_tool_gate,
     agent_scratch,
     agent_sdk,
+    mcp_declined_home,
     model_registry,
     model_scope,
     permission_floor,
@@ -3908,7 +3909,22 @@ class AcpClient:
         RAISES for a backend registered in neither map, and kiro's construction
         path must not gain a failure mode in service of an adapter (H13).
         """
-        return [] if self.backend in MIRRORS else self._pooled_broker_stubs()
+        return [] if self.backend in MIRRORS else self._kiro_session_servers()
+
+    def _kiro_session_servers(self) -> list[dict[str, Any]]:
+        """The broker stubs plus any ``mcp.json`` server the shared spec cannot carry.
+
+        The second half is empty unless this instance is refused the shared agent
+        home (:mod:`kiro_crew.mcp_declined_home`). It is
+        appended AFTER the stub session token is attached, so a third-party
+        server's environment never receives that token.
+        """
+        stubs = self._pooled_broker_stubs()
+        return stubs + mcp_declined_home.session_servers(
+            self._agent,
+            work_dir=self._work_dir,
+            present={str(e.get("name")) for e in stubs},
+        )
 
     def _resolve_session_mcp_servers(self) -> list[dict[str, Any]]:
         """Translate the agent spec into this session's ``mcpServers`` array.
