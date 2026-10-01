@@ -758,9 +758,9 @@ export default function SteeringTab() {
       * gap under the tab strip, and a margin here would stack on it. */}    <h4 className="text-sm font-semibold text-text-strong mb-2 flex items-center gap-2">
       {i18nT('pages.overview.steeringTab.steering_count', { count: files.length })}
       <InfoTip text={i18nT('pages.overview.steeringTab.always_on_markdown_conventions_injected_into_eve')} />
-      <span className="ml-auto">
+      <div className="ml-auto">
         <Btn primary onClick={() => setCreateDialog(true)}>{i18nT('pages.overview.steeringTab.new_steering_file_2')}</Btn>
-      </span>
+      </div>
     </h4>
     <Card>
       <div className="flex items-center gap-2 mb-3">

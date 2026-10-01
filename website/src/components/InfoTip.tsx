@@ -68,7 +68,11 @@ export default function InfoTip({ text, placement = 'auto' }: {
         onClick={(e) => { e.stopPropagation(); setOpen(!open) }}
         className="w-4 h-4 rounded-full border border-border text-muted text-[10px] hover:text-text hover:border-text/30 transition-all leading-none cursor-pointer flex items-center justify-center shrink-0"
         title={text}
-      >?</button>
+      >
+        {/* The glyph is a symbol, not prose: `data-i18n-opaque` keeps the render-time
+            i18n scan from joining it onto the label beside it as orphan punctuation. */}
+        <span data-i18n-opaque="">?</span>
+      </button>
       {open && createPortal(
         <div
           ref={tipRef}

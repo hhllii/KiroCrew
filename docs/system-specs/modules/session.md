@@ -1312,6 +1312,26 @@ against sweep completeness, and are torn down at `close_all`.
   and this sweep runs on the gateway loop, so `set_subagent_probe` accepts an
   awaitable answer and the cleanup boundary awaits it; a sync probe (a double, a
   build with no queue) still answers straight away.
+  An over-ceiling tree that is still using CPU is held, not recycled: a free
+  semaphore only proves Crew's own turn is over, and a backend can keep
+  working inside its own process after that (Claude Code's background
+  workflows), which no Crew probe can see. Each tick reads the tree's total
+  CPU time (`CleanupDeps.tree_cpu_ns`, walked over the shared child map) and
+  compares it with the sample stored on the previous tick; a change of at
+  least `RSS_BUSY_CPU_FRACTION` (0.02) of one core over the elapsed monotonic
+  interval counts as activity, and a drop counts too (a busy child exiting
+  takes its CPU out of the sum). The baseline is keyed by pid AND the
+  process's start identity (`platform_compat.get_process_start_id`, read
+  before the CPU total so a pid reused between the two reads shows up as an
+  identity change rather than a stale comparison): a tree seen for the first
+  time, or under a new identity, has no baseline and is held one tick, so a
+  recycle needs two consecutive low-CPU sweeps. An unreadable CPU total or an
+  unknown identity (`None`) stores no sample and falls back to the plain
+  ceiling rule. The hold shares the harness hold's ceiling: above
+  `HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR` (2) times `watchdog_rss_max_mb`
+  the tree is recycled regardless of activity, with a warning naming the multiple, so a
+  runaway cannot make the operator's limit advisory by staying busy.
+  Each tick keeps samples only for trees that are still over the ceiling.
   The `/proc` parent→child map is built ONCE per tick off-loop
   (`_build_child_map` on the maintenance executor) and shared across
   candidate trees (`_rss_mb_from_tree`); resident pages are summed across the

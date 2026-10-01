@@ -21,6 +21,7 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew import platform_compat
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.process_identity import (
     audit_kill_decision,
@@ -151,6 +152,11 @@ def _no_attached_subagents(key: str) -> bool:
     return False
 
 
+def _no_tree_cpu(pid: int, child_map: dict[int, list[int]]) -> int | None:
+    """Default tree-CPU probe: no reading, so the RSS recycle keeps its old rule."""
+    return None
+
+
 def _no_pending_injection(key: str) -> bool:
     """Default injection probe: a manager with no gateway injects nothing."""
     return False
@@ -178,6 +184,13 @@ class CleanupState:
     # at most once per ``PROBE_FAILURE_WARN_INTERVAL_SECS`` across all keys,
     # never once per candidate per tick.
     probe_failure_warned_at: float | None = None
+    # Runtime pid -> (monotonic time, tree CPU ns, process start identity) from
+    # the last RSS tick that found that tree over the ceiling. The busy-tree
+    # guard compares against it; pruned every tick to the trees still over the
+    # ceiling. The start identity is what makes the baseline belong to a
+    # PROCESS rather than a pid number: a runtime that dies and has its pid
+    # reused between ticks must not inherit the old tree's CPU total.
+    rss_cpu_samples: dict[int, tuple[float, int, str]] = field(default_factory=dict)
     stuck_reported: dict[str, float] = field(default_factory=dict)
     last_pycache_gc: float | None = None
     active_dashboard_slots: set[str] | None = None
@@ -281,6 +294,10 @@ class CleanupDeps:
     provider_background_launch: Callable[[LLMProvider], tuple[float, str] | None] = (
         _no_background_launch
     )
+    # Total CPU time (ns) of a runtime's process tree, walked over the tick's
+    # child map, or None when unreadable. Feeds the RSS recycle's busy-tree
+    # guard. Defaults to "no reading" so a manager without it keeps the old rule.
+    tree_cpu_ns: Callable[[int, dict[int, list[int]]], int | None] = _no_tree_cpu
 
 
 class SessionCleanup:
@@ -294,6 +311,14 @@ class SessionCleanup:
     # RSS reap, so it must surface above debug -- but one line per candidate
     # per tick is the noise this bound exists to prevent.
     PROBE_FAILURE_WARN_INTERVAL_SECS = 3600.0
+
+    # Share of one core a session's process tree may use between two RSS ticks
+    # and still count as idle. A free semaphore only proves Crew's own turn is
+    # over: a backend can keep working on its own after the turn returns (Claude
+    # Code runs ultracode workflows in the background, inside its own process),
+    # and no Crew probe can see that work. An idle CLI sits near 0% of a core,
+    # so a tree above this is treated as working and is not recycled this tick.
+    RSS_BUSY_CPU_FRACTION = 0.02
 
     # Floor between two WARNING lines about a reconcile pass that refuses. A
     # refusal disables both reclamation directions and stops the liveness SLI
@@ -724,6 +749,9 @@ class SessionCleanup:
 
     async def _rss_threshold_check(self) -> None:
         if not self.state.rss_max_mb:
+            # A baseline kept across a disabled stretch would average new work
+            # over the whole gap and read it as idle once re-enabled.
+            self.state.rss_cpu_samples.clear()
             return
 
         candidates: list[tuple[str, int, SessionEntry]] = []
@@ -740,8 +768,9 @@ class SessionCleanup:
                     candidates.append((key, pid, session))
 
         victims: list[tuple[str, int, int, SessionEntry]] = []
+        child_map: dict[int, list[int]] = {}
+        loop = asyncio.get_running_loop()
         if candidates:
-            loop = asyncio.get_running_loop()
             measure: Callable[[int], int]
             if self._deps.is_windows():
 
@@ -775,6 +804,53 @@ class SessionCleanup:
                     rss_by_pid[pid] = rss
                 if rss > self.state.rss_max_mb:
                     victims.append((key, pid, rss, session))
+
+        # Busy-tree guard. A tree still burning CPU is doing work Crew cannot
+        # see (a backend's own background agents), and recycling it kills that
+        # work. A tree is recycled only once two ticks in a row show it idle.
+        over = {pid for _key, pid, _rss, _session in victims}
+        busy: set[int] = set()
+        for pid in over:
+            cpu_ns, start_id = await loop.run_in_executor(
+                self._deps.get_maintenance_executor(),
+                self._probe_tree_activity,
+                pid,
+                child_map,
+            )
+            if self._tree_is_busy(pid, cpu_ns, start_id):
+                busy.add(pid)
+        self.state.rss_cpu_samples = {
+            pid: sample for pid, sample in self.state.rss_cpu_samples.items() if pid in over
+        }
+        if busy:
+            # The guard shares the harness hold's ceiling: above
+            # HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR times the limit,
+            # activity does not spare the tree.
+            hard_cap_mb = HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR * self.state.rss_max_mb
+            kept: list[tuple[str, int, int, SessionEntry]] = []
+            for victim in victims:
+                key, pid, rss, _session = victim
+                if pid not in busy:
+                    kept.append(victim)
+                elif rss > hard_cap_mb:
+                    self._deps.logger.warning(
+                        "RSS recycle: session %s tree rss=%dMB is over %dx the "
+                        "%dMB ceiling; recycling although its tree is still using CPU",
+                        key,
+                        rss,
+                        HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR,
+                        self.state.rss_max_mb,
+                    )
+                    kept.append(victim)
+                else:
+                    self._deps.logger.info(
+                        "RSS recycle: session %s tree rss=%dMB exceeds %dMB "
+                        "but its tree is still using CPU; skipping",
+                        key,
+                        rss,
+                        self.state.rss_max_mb,
+                    )
+            victims = kept
 
         # One RECLAIM per runtime per tick. The threshold was crossed by a
         # process, and every session on it reads the same figure, so recycling
@@ -906,6 +982,49 @@ class SessionCleanup:
         except Exception:
             self._deps.logger.debug("Background-launch probe failed", exc_info=True)
             return None
+
+    def _probe_tree_activity(
+        self, pid: int, child_map: dict[int, list[int]]
+    ) -> tuple[int | None, str | None]:
+        """One executor hop for both readings the busy-tree guard needs.
+
+        The start identity is read FIRST: if the pid is reused between the two
+        reads, the CPU total belongs to the new process while the identity
+        still names the old one, and the next tick sees an identity change and
+        holds -- the safe direction. Read the other way round, a stale identity
+        could be paired with a fresh total and compared as if nothing changed.
+        """
+        start_id = platform_compat.get_process_start_id(pid)
+        return self._deps.tree_cpu_ns(pid, child_map), start_id
+
+    def _tree_is_busy(self, pid: int, cpu_ns: int | None, start_id: str | None) -> bool:
+        """Whether *pid*'s tree used CPU since the last tick that measured it.
+
+        ``cpu_ns`` of ``None`` is no reading, so the old rule applies (not
+        busy). A tree seen for the first time has no baseline yet, so it is
+        held one tick. The baseline is keyed by *start_id* as well as pid: a
+        different identity under the same pid is a different process, so it is
+        treated exactly like a first sight -- held one tick, never compared
+        against the dead tree's total (which could read as idle and recycle a
+        runtime that only just started working). An unknown identity
+        (``None``) cannot anchor a baseline either way, so no sample is kept
+        and the old rule applies, the same as an unreadable CPU total. A drop
+        counts as activity too: a busy child exiting takes its CPU time out of
+        the sum. Nothing here is affected by wall-clock changes: the stamp is
+        monotonic.
+        """
+        if cpu_ns is None or start_id is None:
+            self.state.rss_cpu_samples.pop(pid, None)
+            return False
+        now = self._deps.monotonic()
+        previous = self.state.rss_cpu_samples.get(pid)
+        self.state.rss_cpu_samples[pid] = (now, cpu_ns, start_id)
+        if previous is None or previous[2] != start_id:
+            return True
+        elapsed_ns = (now - previous[0]) * 1_000_000_000
+        if elapsed_ns <= 0:
+            return True
+        return abs(cpu_ns - previous[1]) >= self.RSS_BUSY_CPU_FRACTION * elapsed_ns
 
     def _injection_pending(self, key: str) -> bool:
         """Fail-closed read of "is a completion injection in flight for *key*?".

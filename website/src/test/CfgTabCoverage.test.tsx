@@ -305,6 +305,35 @@ describe('KiroCrewCfgTab — numeric rows', () => {
     })
   })
 
+  it('saves only a plain integer: exponent and decimal forms are refused', async () => {
+    // parseInt would have read `1e3` and `1.5` as 1 and saved it; the row must
+    // flag the draft instead and leave the stored value alone.
+    const updated = clone()
+    updated.session = { ...updated.session, watchdog_rss_max_mb: 2048 }
+    seed(CFG, updated)
+
+    await renderTab()
+    const input = num('Idle Session Memory Limit')
+
+    fireEvent.change(input, { target: { value: '1e3' } })
+    fireEvent.blur(input)
+    expect(screen.getByText('invalid')).toBeInTheDocument()
+    expect(input.value).toBe('1e3')
+    expect(vi.mocked(api).patchConfig).not.toHaveBeenCalled()
+
+    fireEvent.change(input, { target: { value: '1.5' } })
+    fireEvent.blur(input)
+    expect(screen.getByText('invalid')).toBeInTheDocument()
+    expect(vi.mocked(api).patchConfig).not.toHaveBeenCalled()
+
+    fireEvent.change(input, { target: { value: '2048' } })
+    fireEvent.blur(input)
+    await waitFor(() => {
+      expect(vi.mocked(api).patchConfig).toHaveBeenCalledWith('session.watchdog_rss_max_mb', 2048)
+    })
+    expect(screen.queryByText('invalid')).toBeNull()
+  })
+
   it('does not patch when the committed value equals the current one', async () => {
     await renderTab()
     const input = num('Pool Size')
