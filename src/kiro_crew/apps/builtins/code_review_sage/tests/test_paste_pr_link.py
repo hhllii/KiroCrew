@@ -14,16 +14,33 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from aiohttp import web
 from backend import routes
 from sage_lib import discovery, store
 
+_OWNER = "sage-owner"
 
-class _FakeRequest:
+
+class _OwnerRequest(dict):
+    """The identity the dashboard auth middleware stamps on the owner's request.
+
+    The routes' owner gate reads ``request.app["state"].owner_id`` and the
+    ``user`` / ``app`` keys, so a fake that carries the owner's real identity lets
+    the gate run unpatched and admit it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(user=_OWNER, app="")
+        self.app = {"state": SimpleNamespace(owner_id=_OWNER)}
+
+
+class _FakeRequest(_OwnerRequest):
     """Minimal stand-in: the handler reads the method and the JSON body."""
 
     def __init__(self, body: dict, method: str = "POST"):
+        super().__init__()
         self._body = body
         self.method = method
 

@@ -488,7 +488,7 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rv["effort"] == "" or rv["effort"] in _rp.VALID_EFFORTS)
 
     async def test_review_rejects_empty_input(self):
-        class _Req:
+        class _Req(_OwnerRequest):
             async def json(self):
                 return {}
         resp = await self.mod._handle_review(_Req())
@@ -501,7 +501,7 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
 
         _url = "https://github.com/kirodotdev/KiroCrew/pull/20"
 
-        class _Req:
+        class _Req(_OwnerRequest):
             async def json(self):
                 return {"links": _url}
         resp = await self.mod._handle_review(_Req())
@@ -2298,12 +2298,15 @@ class TestConsolidationCannotResurrectADeletedNamespace(unittest.IsolatedAsyncio
                          "a delete must not be refused after pruning the active list")
 
     async def _delete(self, ns):
-        req = unittest.mock.MagicMock()
-        req.method = "DELETE"
-        req.json = unittest.mock.AsyncMock(return_value={"name": ns})
-        req.query = {}
-        req.match_info = {}
-        return await self.mod._handle_namespaces(req)
+        class _DeleteReq(_OwnerRequest):
+            method = "DELETE"
+            query: dict = {}
+            match_info: dict = {}
+
+            async def json(self):
+                return {"name": ns}
+
+        return await self.mod._handle_namespaces(_DeleteReq())
 
 
 class TestPhase1ValuesMustBeStrings(unittest.TestCase):
@@ -2774,8 +2777,25 @@ class _FakeState:
         return value
 
 
-class _Req:
+_OWNER = "sage-owner"
+
+
+class _OwnerRequest(dict):
+    """The identity the dashboard auth middleware stamps on the owner's request.
+
+    The routes' owner gate reads ``request.app["state"].owner_id`` and the
+    ``user`` / ``app`` keys, so a fake that carries the owner's real identity lets
+    the gate run unpatched and admit it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(user=_OWNER, app="")
+        self.app = {"state": types.SimpleNamespace(owner_id=_OWNER)}
+
+
+class _Req(_OwnerRequest):
     def __init__(self, body=None, query=None):
+        super().__init__()
         self._body = body or {}
         self.query = query or {}
 

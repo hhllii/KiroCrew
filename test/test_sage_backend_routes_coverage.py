@@ -31,6 +31,7 @@ import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 from aiohttp import web
 
@@ -54,7 +55,23 @@ def _load_routes_module():
     return mod
 
 
-class _Req:
+_OWNER = "sage-owner"
+
+
+class _OwnerRequest(dict):
+    """The identity the dashboard auth middleware stamps on the owner's request.
+
+    The routes' owner gate reads ``request.app["state"].owner_id`` and the
+    ``user`` / ``app`` keys, so a fake that carries the owner's real identity lets
+    the gate run unpatched and admit it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(user=_OWNER, app="")
+        self.app = {"state": SimpleNamespace(owner_id=_OWNER)}
+
+
+class _Req(_OwnerRequest):
     """Minimal stand-in for an aiohttp request (same shape the app suite uses).
 
     A ``None`` body makes ``json()`` raise, which is how a real request with no
@@ -62,6 +79,7 @@ class _Req:
     """
 
     def __init__(self, *, run_id=None, query=None, method="GET", body=None):
+        super().__init__()
         self.match_info = {} if run_id is None else {"run_id": run_id}
         self.query = query or {}
         self.method = method
