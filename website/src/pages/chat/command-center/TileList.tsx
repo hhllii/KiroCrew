@@ -4,7 +4,7 @@ import { PanelRightOpen } from 'lucide-react'
 import { Btn } from '../../../components/ui'
 import ErrorNotice from '../../../components/ErrorNotice'
 import { fmtNumber } from '../../../i18n/format'
-import { approvalTitle, runTitle, type AttentionItem, type CommandCenterModel, type RunNode } from './model'
+import { approvalTitle, questionText, runTitle, type AttentionItem, type CommandCenterModel, type RunNode } from './model'
 import type { Tile } from './StatusTiles'
 
 /** Rows one list shows before the rest is left to the side panel. */
@@ -90,7 +90,7 @@ export default function TileList({ tile, data, onOpen }: { tile: Tile; data: Dat
       // (Approvals, Questions) stay with the panel's tabs.
       const kind = item.kind === 'approval' ? t('commandCenter.badge_approval') : item.kind === 'question' ? t('commandCenter.badge_question') : t('commandCenter.state_needs_input')
       const title = item.approval ? approvalTitle(item.approval) || t('commandCenter.approval_needed')
-        : item.question?.questions[0]?.question || (node ? runTitle(node) : '')
+        : (item.question && questionText(item.question)) || (node ? runTitle(node) : '')
       return row(item.id, title, undefined, kind)
     })
     if (!rows.length) rows = [<li key="empty" className="text-[12px] text-muted">{t('commandCenter.no_input')}</li>]
