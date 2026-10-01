@@ -68,10 +68,12 @@ vi.mock('../api/client', () => ({
 import chatReducer, {
   PANE_HYDRATE_LIMIT,
   WINDOW_WALK_MAX_PAGES,
+  appendSlotMessage,
   hydrateSlotMessages,
   refreshSlot,
   setActiveSlot,
   switchSlot,
+  warmSlotCache,
 } from './chatSlice'
 import { api } from '../api/client'
 
@@ -309,6 +311,116 @@ describe('walkWindowBackTo', () => {
       expect(after.messages).toHaveLength(1300)
       expect(after.messages[0].content).toBe('m0')
       expect(after.slotHasMore).toBe(false)
+    })
+  })
+
+  describe('warmSlotCache', () => {
+    /** A background pane holding rows `[from, from + n)`, as a switch away caches it. */
+    function backgroundPane(n: number, from: number, total: number) {
+      const store = makeStore({ activeSlot: 'other' })
+      store.dispatch(setActiveSlot('other'))
+      store.dispatch(hydrateSlotMessages({
+        slot: SLOT, messages: rows(n, from), hasMore: from > 0,
+        bounded: true, total, running: false,
+      }))
+      return store
+    }
+    const cached = (store: ReturnType<typeof makeStore>) =>
+      (store.getState().chat.slotMessages?.[SLOT] ?? []).map(m => m.content)
+
+    it('warms a pane past the clamp with one bounded page, not the whole transcript', async () => {
+      // The reported case: a background pane holds the newest 8,000 rows of an
+      // 8,000-row session and its turn ends with two new rows. One clamp-sized
+      // page overlaps the cache, so one request does it -- the cache is too wide
+      // for a count-matched limit, which used to mean an unbounded read.
+      HISTORY = rows(8000)
+      const store = backgroundPane(8000, 0, 8000)
+      HISTORY = rows(8002)
+
+      await store.dispatch(warmSlotCache(SLOT) as never)
+
+      expect(requests()).toEqual([[SERVER_CLAMP, undefined]])
+      const contents = cached(store)
+      // The held head above the page survived, and the new rows landed.
+      expect(contents).toHaveLength(8002)
+      expect(contents[0]).toBe('m0')
+      expect(contents.at(-1)).toBe('m8001')
+      expect(new Set(contents).size).toBe(contents.length)
+    })
+
+    it('walks a coverage gap older, bounded, and keeps the held head where it anchors', async () => {
+      // The pane holds rows 0..599 and the server gained 1,400 while it was off
+      // screen. The newest page (1500..1999) misses the cache; the walk reads
+      // 1000..1499 and 500..999, which anchors cache row 500. Stop there.
+      HISTORY = rows(600)
+      const store = backgroundPane(600, 0, 600)
+      HISTORY = rows(2000)
+
+      await store.dispatch(warmSlotCache(SLOT) as never)
+
+      expect(requests()).toEqual([
+        [SERVER_CLAMP, undefined],
+        [SERVER_CLAMP, 1500],
+        [SERVER_CLAMP, 1000],
+        [SERVER_CLAMP, undefined],
+      ])
+      const contents = cached(store)
+      expect(contents).toHaveLength(2000)
+      // Rows 0..499 sat above the walked window: the reducer kept them.
+      expect(contents[0]).toBe('m0')
+      expect(contents).toContain('m599')
+      expect(contents.at(-1)).toBe('m1999')
+      expect(new Set(contents).size).toBe(contents.length)
+    })
+
+    it('keeps a just-sent row when the walk stops on a window that contains the whole cache', async () => {
+      // The pane holds rows 1100..1149 plus a send the server has not persisted yet,
+      // and the server is now 2,000 rows deep. The walk's second older page
+      // (949..1448) contains the cache's oldest row, so it stops on a SUPERSET whose
+      // own oldest row is older than the cache. That window covers the cache: the
+      // just-sent row must survive as newer than the page, not be dropped as if the
+      // walk had run out of pages.
+      HISTORY = rows(1150)
+      const store = backgroundPane(50, 1100, 1150)
+      store.dispatch(appendSlotMessage({
+        slot: SLOT,
+        message: { role: 'user', content: 'just sent', cls: 'msg msg-u', ts: new Date(Date.UTC(2026, 0, 2)).toISOString(), meta: { sendId: 's-1' } } as never,
+      }))
+      HISTORY = rows(2000)
+
+      await store.dispatch(warmSlotCache(SLOT) as never)
+
+      expect(limits()).not.toContain(undefined)
+      const contents = cached(store)
+      expect(contents).toContain('m1100')
+      expect(contents).toContain('m1999')
+      expect(contents.at(-1)).toBe('just sent')
+    })
+
+    it('never reads unbounded, spending at most 1 + cap + 1 requests, and replaces rather than splices when the cap runs out', async () => {
+      // The gap is wider than the cap covers: the pane holds rows 0..4999 -- more
+      // than the walk's whole window -- and the server is 20,000 rows deep. The walk
+      // takes exactly the cap and stops, where the unbounded read it replaces would
+      // have moved all 20,000. The walked window is disjoint from the cache, so
+      // merging would publish a hole between row 4999 and the window; the pane takes
+      // the window instead, with a paging cursor that reaches the rest.
+      HISTORY = rows(5000)
+      const store = backgroundPane(5000, 0, 5000)
+      HISTORY = rows(20_000)
+
+      await store.dispatch(warmSlotCache(SLOT) as never)
+
+      const sent = limits()
+      expect(sent).not.toContain(undefined)
+      expect(sent).toHaveLength(1 + WINDOW_WALK_MAX_PAGES + 1)
+      expect(Math.max(...(sent as number[]))).toBeLessThanOrEqual(SERVER_CLAMP)
+      const contents = cached(store)
+      const walked = (1 + WINDOW_WALK_MAX_PAGES) * SERVER_CLAMP
+      expect(contents).toHaveLength(walked)
+      expect(contents[0]).toBe(`m${20_000 - walked}`)
+      expect(contents.at(-1)).toBe('m19999')
+      expect(contents).not.toContain('m4999')
+      expect(store.getState().chat.slotPaneHasMore?.[SLOT]).toBe(true)
     })
   })
 })
