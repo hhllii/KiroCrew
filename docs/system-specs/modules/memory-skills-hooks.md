@@ -3561,7 +3561,24 @@ including rendered framing. Exceeding the capacity or refusing a required read
 raises `SkillContextCapacityError`; no final slice may silently discard required
 instructions. Bounded global reads use `safe_read_file_bytes_nolink`, retaining
 sensitive-path, descriptor identity and hardlink checks while allowing validated
-provider links. Project reads retain descriptor confinement and their byte cap.
+provider links. One hardlink is admitted, on content: a hardlinking installer (uv's
+default on Linux and Windows) gives every installed package file `st_nlink > 1`, so
+a built-in app skill symlinked into the tree by `apps.bridges._register_skills`
+listed but never loaded, and an `always: true` one raised
+`SkillContextCapacityError` on every session start. `_read_global_skill_text`
+therefore passes `admit_hardlinked=_installed_package_bytes_match`: a hardlinked
+file loads only when it is a `SKILL.md` the owning distribution's `RECORD` lists
+inside the installed `kiro_crew` tree AND the bytes read from the descriptor hash
+to the recorded digest (sha256 or stronger). Any other hardlink — the skills dir,
+apps under the data home, `extra_paths`, a project — has no `RECORD` entry and stays
+refused. An editable install's `RECORD` lists no package files, so it admits
+nothing. The digests come from `importlib.metadata` (the distribution that lists
+the package's own `__init__.py`), are cached per process and keyed on the `RECORD`
+file's inode, mtime and size, so a reinstall that writes a new `RECORD` is judged
+against it; a lookup that finds no `RECORD` (mid-upgrade) is not cached.
+Rewriting `RECORD` takes write access to the tree holding the package code, which
+already decides what the gateway runs. Project reads retain descriptor confinement
+and their byte cap.
 The explicit unbudgeted catalog renderer remains available to non-startup callers.
 
 Native Kiro 2.21.2 progressively loads bodies but places every mapped skill's

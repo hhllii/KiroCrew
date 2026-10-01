@@ -17,9 +17,12 @@ call it as an attribute of that module, so the patch reaches every caller.
 from __future__ import annotations
 
 import asyncio
+import base64
 import difflib
 import functools
 import hashlib
+import hmac
+import importlib.metadata
 import json
 import logging
 import os
@@ -448,6 +451,16 @@ _AUTO_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
 # Bundled fallback — inside the kiro_crew package
 _BUILTIN_SKILLS_DIR = Path(__file__).parent / "builtin_skills"
 
+#: The installed ``kiro_crew`` package tree: a trusted provider root for skill
+#: symlinks, and the only tree whose hardlinked ``SKILL.md`` can be admitted (see
+#: :func:`_installed_package_bytes_match`). A module binding so a test can stand
+#: up a fake site dir.
+_INSTALLED_PACKAGE_DIR = Path(__file__).parent
+
+#: RECORD hash names accepted as an admission witness: the wheel spec requires
+#: sha256 or stronger, and a weaker one could be matched on purpose.
+_RECORD_HASHES = frozenset({"sha256", "sha384", "sha512"})
+
 
 @dataclass(frozen=True)
 class AutoSkillProvenance:
@@ -562,12 +575,105 @@ def _trusted_skill_roots() -> tuple[str, ...]:
     A symlink resolving anywhere else stays rejected: an arbitrary target would
     admit unvetted ``SKILL.md`` prose into the agent's context.
     """
-    roots: list[str] = [os.path.realpath(Path(__file__).parent)]
+    roots: list[str] = [os.path.realpath(_INSTALLED_PACKAGE_DIR)]
     try:
         roots.append(os.path.realpath(config_dir() / "apps"))
     except Exception:  # noqa: BLE001 — an unresolvable data home must not stop scanning
         pass
     return tuple(roots)
+
+
+_package_record_lock = threading.Lock()
+#: package dir -> (RECORD path, its stat stamp, recorded ``SKILL.md`` digests).
+_package_record_cache: dict[str, tuple[str, tuple[int, int, int], dict[str, tuple[str, str]]]] = {}
+
+
+def _record_stamp(record: str) -> tuple[int, int, int] | None:
+    try:
+        st = os.stat(record)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _read_package_record(package_dir: str) -> tuple[str, dict[str, tuple[str, str]]] | None:
+    """The owning distribution's RECORD path and its ``SKILL.md`` digests.
+
+    Ownership, not a distribution name, picks the distribution: its RECORD must
+    list the package's own ``__init__.py``. An editable install's RECORD lists no
+    package files, so it answers ``None`` and nothing is admitted.
+    """
+    site_dir = os.path.dirname(package_dir)
+    owned = PurePosixPath(os.path.basename(package_dir), "__init__.py")
+    try:
+        for dist in importlib.metadata.distributions(path=[site_dir]):
+            files = dist.files or []
+            if not any(entry == owned for entry in files):
+                continue
+            record: str | None = None
+            digests: dict[str, tuple[str, str]] = {}
+            for entry in files:
+                if entry.name == "RECORD" and entry.parent.name.endswith(".dist-info"):
+                    record = os.path.realpath(str(entry.locate()))
+                elif entry.name == _SKILL_FILE and entry.hash is not None:
+                    absolute = os.path.normpath(os.path.join(site_dir, str(entry)))
+                    if _within_any(absolute, (package_dir,)):
+                        digests[os.path.normcase(absolute)] = (
+                            entry.hash.mode.lower(),
+                            entry.hash.value,
+                        )
+            return (record, digests) if record is not None else None
+    except Exception:  # noqa: BLE001 — unreadable metadata admits nothing
+        return None
+    return None
+
+
+def _recorded_skill_digests() -> dict[str, tuple[str, str]]:
+    """The installed package's recorded ``SKILL.md`` digests, re-read on reinstall.
+
+    Cached per process and keyed on the RECORD file's identity, so a reinstall
+    that writes a new RECORD is re-read rather than judged against the previous
+    install's hashes. A lookup that finds no RECORD is not cached: one that lands
+    mid-upgrade must not switch admission off until the next restart.
+    """
+    package_dir = os.path.realpath(_INSTALLED_PACKAGE_DIR)
+    with _package_record_lock:
+        cached = _package_record_cache.get(package_dir)
+    if cached is not None and _record_stamp(cached[0]) == cached[1]:
+        return cached[2]
+    found = _read_package_record(package_dir)
+    if found is None:
+        return {}
+    record, digests = found
+    stamp = _record_stamp(record)
+    if stamp is not None:
+        with _package_record_lock:
+            _package_record_cache[package_dir] = (record, stamp, digests)
+    return digests
+
+
+def _installed_package_bytes_match(path: str, data: bytes) -> bool:
+    """Admit a hardlinked ``SKILL.md`` only when it IS the installed package's file.
+
+    Installers such as uv hardlink package files out of their cache, so a
+    built-in app skill can legitimately carry ``st_nlink > 1``. The no-link
+    reader refuses that shape everywhere else; here it is admitted on content:
+    *path* must be a ``SKILL.md`` the distribution's RECORD lists inside the
+    installed package tree, and *data* (the bytes actually read) must hash to the
+    digest recorded for it. Any other hardlinked file, including one in the
+    skills dir, an app under the data home, an extra path or a project, has no
+    RECORD entry and stays refused. Rewriting RECORD needs write access to the
+    same tree as the package code, which already decides what the gateway runs.
+    """
+    try:
+        entry = _recorded_skill_digests().get(os.path.normcase(os.path.normpath(path)))
+        if entry is None or entry[0] not in _RECORD_HASHES:
+            return False
+        digest = hashlib.new(entry[0], data).digest()
+        actual = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        return hmac.compare_digest(actual, entry[1])
+    except Exception:  # noqa: BLE001 — an admission that cannot be decided refuses
+        return False
 
 
 def _within_any(candidate: str, roots: tuple[str, ...]) -> bool:
@@ -3088,7 +3194,10 @@ class SkillsLoader:
         UTF-8, preserving the global listing path's decode behavior. Every body
         read uses the shared validated reader without project confinement:
         sensitive paths, hardlinks and identity changes are refused on the
-        descriptor supplying the bytes.
+        descriptor supplying the bytes. The one hardlink admitted is an installed
+        package ``SKILL.md`` whose bytes match the installer's RECORD digest
+        (:func:`_installed_package_bytes_match`), which is how a hardlinking
+        installer lays out the built-in app skills this method serves.
 
         With a bound, refuse rather than truncate. A caller that asked for at
         most N bytes is deciding whether the body FITS, and half a skill is not
@@ -3102,6 +3211,7 @@ class SkillsLoader:
                 max_bytes=max_bytes,
                 within_root=canonical_root,
                 within_root_is_canonical=canonical_root is not None,
+                admit_hardlinked=_installed_package_bytes_match,
             )
         except FileTooLargeError:
             if max_bytes is None:
