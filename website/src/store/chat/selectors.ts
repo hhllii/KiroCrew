@@ -67,12 +67,7 @@ export const selectComposerBusy = (state: RootState, slot: string | null): boole
   if (slot === state.chat.activeSlot && state.chat.slotRunning) return true
   if (selectSlotSubagentsActive(state, slot)) return true
   const dashSlot = state.dashboard.slots.find((sl) => sl.key === slot)
-  // A running autopilot plan keeps the composer "busy" so a mid-plan message
-  // queues (chip card) instead of rendering an optimistic bubble that would
-  // duplicate the backend's queued message. slot.running reads False between
-  // stages, so orchestrating is the durable signal here. Kept until the backend
-  // stops sending the field; the StageBoundary cleanup removes both reads.
-  return !!(dashSlot?.subagents_running || dashSlot?.orchestrating)
+  return !!dashSlot?.subagents_running
 }
 
 /** `meta.injectKind` values the gateway stamps on an `inject` row that dispatched a
@@ -142,12 +137,8 @@ export const selectActiveSlotProject = (state: RootState): string | undefined =>
 export const selectContinuable = (state: RootState): boolean => {
   const c = state.chat
   if (c.slotRunning || c.slotStopping || c.pendingTurnSlot) return false
-  // An autopilot plan reads `running` False BETWEEN stages while still mid-plan,
-  // so `running` alone would offer Continue on a slot the server refuses with
-  // `slot_orchestrating`. Mirrors the same guard in `api_chat_slot_continue`.
-  // Kept until the backend stops sending the field (StageBoundary cleanup).
   const dashSlot = state.dashboard.slots.find((sl) => sl.key === c.activeSlot)
-  if (dashSlot?.orchestrating || dashSlot?.subagents_running) return false
+  if (dashSlot?.subagents_running) return false
   // A crew-bound session has NO local continue: `remote_bound_refusal` rejects
   // `executor === 'remote'` with 409 `remote_action_unsupported` ahead of every
   // guard above, because the synthetic turn Continue queues would dispatch on

@@ -348,22 +348,14 @@ class _FairnessMixin(ManagerComponent):
         if not view.any_slot:
             return None
         for idx, params in enumerate(queue):
-            if (
-                params.get("_resume_id")
-                and not params.get("_startup_release")
-                and not self._manager._boundary_cancellation_pending(params)
-            ):
+            if params.get("_resume_id") and not params.get("_startup_release"):
                 return idx
         roots_ok = view.root_slot
 
         def eligible(params: Mapping[str, Any]) -> bool:
             # A released start is never picked here: the pump's own phase
             # (``_release_admitted_start_impl``) meters it, ahead of this pick.
-            return (
-                not params.get("_startup_release")
-                and not self._manager._boundary_cancellation_pending(params)
-                and (roots_ok or self.entry_is_child(params))
-            )
+            return not params.get("_startup_release") and (roots_ok or self.entry_is_child(params))
 
         def lane_of(params: Mapping[str, Any]) -> str:
             return self.lane_of_entry(params, lanes)

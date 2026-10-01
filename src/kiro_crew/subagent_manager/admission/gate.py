@@ -45,7 +45,6 @@ class _GateMixin(ManagerComponent):
     if TYPE_CHECKING:
         # Sibling-mixin methods this module reaches through ``self``; typing only.
         CLAIM_UNAVAILABLE: str
-        CLAIM_RETAINED: str
 
         TASK_STORE_UNAVAILABLE_CODE: str
 
@@ -200,7 +199,6 @@ class _GateMixin(ManagerComponent):
         target_member: str | None = None,
         delegation: dict[str, str] | None = None,
         _execution_context: dict | None = None,
-        _stage_boundary_owner: str = "",
         _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
     ) -> "SubagentInfo | PreparedSpawn | ClaimPoint | None":
         """Spawn a subagent for *task*.
@@ -601,7 +599,6 @@ class _GateMixin(ManagerComponent):
             # in the ordinary case, and a full parse only when the memo
             # declines to pin.
             "crew": crew,
-            "_stage_boundary_owner": _stage_boundary_owner,
             "_memory_mode": _memory_mode,
             # Same rule for the asking turn: `spawn_async` re-enters from this
             # dict (prepare -> write -> re-enter), so a follow-up whose asking
@@ -1101,33 +1098,23 @@ class _GateMixin(ManagerComponent):
                 # counted by every admission decided in between.
                 self._manager._startup_reservations += 1
                 self._manager._last_spawn_ts = time.monotonic()
-                return ClaimPoint(agent_id, parent_session_key, _stage_boundary_owner)
+                return ClaimPoint(agent_id, parent_session_key)
             taskq_generation, proceed, claim_reason = self._manager._admission.taskq_claim(agent_id)
-        if not proceed and claim_reason in (self.CLAIM_UNAVAILABLE, self.CLAIM_RETAINED):
-            # A pre-claim outage leaves the row QUEUED and needs an ordinary
-            # refill. A post-claim outage leaves it ADMITTED under this process;
-            # claim_and_start retains its generation and reservation, and its
-            # dedicated retry pass owns the wake.
-            retained = claim_reason == self.CLAIM_RETAINED
-            logger.warning(
-                "taskq: %s of %s unavailable; %s",
-                "post-claim settlement" if retained else "claim",
-                agent_id,
-                "retained admitted generation" if retained else "left queued for the pump",
-            )
-            # The row is still QUEUED (or ADMITTED and retained), so the depth
-            # published here must count it. A pump that popped it marked it
-            # dispatching; that mark describes an attempt that just ended.
+        if not proceed and claim_reason == self.CLAIM_UNAVAILABLE:
+            # A claim outage leaves the row QUEUED and needs an ordinary refill.
+            logger.warning("taskq: claim of %s unavailable; left queued for the pump", agent_id)
+            # The row is still QUEUED, so the depth published here must count
+            # it. A pump that popped it marked it dispatching; that mark
+            # describes an attempt that just ended.
             self._manager._dispatching_ids.discard(agent_id)
             self._manager._emit_queue_depth(parent_session_key, batch_id)
-            if not retained:
-                try:
-                    asyncio.get_event_loop().call_later(
-                        self._manager._admission.taskq_admit_wait_secs(),
-                        self._manager._drain_queue,
-                    )
-                except RuntimeError:
-                    pass
+            try:
+                asyncio.get_event_loop().call_later(
+                    self._manager._admission.taskq_admit_wait_secs(),
+                    self._manager._drain_queue,
+                )
+            except RuntimeError:
+                pass
             info = SubagentInfo(
                 id=agent_id,
                 task=_redacted_task,
