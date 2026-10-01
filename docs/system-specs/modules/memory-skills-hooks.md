@@ -3556,10 +3556,22 @@ apps or bypass the existing project consent boundary.
 Ordinary mapped and project skills are activated on demand. `skill_search` always
 provides `action="list"` plus `offset` for complete discovery and `action="read"`
 plus the exact `key` for activation, even while the body index is incomplete.
-Required `always:true` bodies share `PINNED_SKILL_BODIES_CAP` (99,000 UTF-8 bytes),
-including rendered framing. Exceeding the capacity or refusing a required read
-raises `SkillContextCapacityError`; no final slice may silently discard required
-instructions. Bounded global reads use `safe_read_file_bytes_nolink`, retaining
+The operator's required `always:true` bodies share `PINNED_SKILL_BODIES_CAP`
+(99,000 UTF-8 bytes), including rendered framing. Exceeding the capacity or refusing
+a required read raises `SkillContextCapacityError`; no final slice may silently
+discard required instructions. A trusted project's `always:true` bodies are not
+charged there: a checked-out repository must not be able to fail every session in
+that project. They ride their own `project_body_budget` (`PROJECT_SKILL_BODY_CAP`
+from both `context.py` callers) through `_append_project_skill_bodies`, and one that
+does not fit or cannot be read is skipped. One warning per session names the
+skipped keys with their reasons, the trusted project, and that project's revocable
+project-skill trust grant. The required block carries a notice naming the same keys
+with their `skill_search(action='read', ...)` pointers, so the omission is visible in
+the prompt, and the rows join the on-demand directory. A repository chooses how many
+rows it ships, so both name keys only within `_SKIPPED_PROJECT_KEYS_MAX_CHARS` (2,000)
+and count the rest. Each read stays bounded by the room left in that budget, and the
+delivered bytes are re-checked against `repo_scope`. Bounded global reads use
+`safe_read_file_bytes_nolink`, retaining
 sensitive-path, descriptor identity and hardlink checks while allowing validated
 provider links. Project reads retain descriptor confinement and their byte cap.
 The explicit unbudgeted catalog renderer remains available to non-startup callers.
